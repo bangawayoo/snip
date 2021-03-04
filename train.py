@@ -1,351 +1,377 @@
+from __future__ import print_function
+
+import argparse
+import os
+import random
+import shutil
+import time
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.parallel
+import torch.backends.cudnn as cudnn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+import torch.utils.data as data
+import numpy as np
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+from torch.utils.tensorboard import SummaryWriter
 
-from torchvision.datasets import MNIST, CIFAR10
-from torchvision.transforms import Compose, ToTensor, Normalize
-from torchvision import transforms
+import models.cifar as models
+from models.cifar.our_resnet import  resnet32_cifar100
+from utils.misc import get_conv_zero_param
+from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
+from prune_util import NTK_Prune, __NTK_Prune, Random_Prune
 
-from tensorboardX import SummaryWriter
-from ignite.engine import Events, create_supervised_trainer, create_supervised_evaluator
-from ignite.metrics import Accuracy, Loss
-from ignite.contrib.handlers import ProgressBar
+model_names = sorted(name for name in models.__dict__
+    if name.islower() and not name.startswith("__")
+    and callable(models.__dict__[name]))
 
-from snip import SNIP
+parser = argparse.ArgumentParser(description='PyTorch CIFAR10/100 Training')
+# Datasets
+parser.add_argument('-d', '--dataset', default='cifar10', type=str)
+parser.add_argument('-j', '--workers', default=1, type=int, metavar='N',
+                    help='number of data loading workers (default: 4)')
+# Optimization options
+parser.add_argument('--epochs', default=100, type=int, metavar='N',
+                    help='number of total epochs to run')
+parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
+                    help='manual epoch number (useful on restarts)')
+parser.add_argument('--train-batch', default=128, type=int, metavar='N',
+                    help='train batchsize')
+parser.add_argument('--test-batch', default=128, type=int, metavar='N',
+                    help='test batchsize')
+parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
+                    metavar='LR', help='initial learning rate')
+parser.add_argument('--drop', '--dropout', default=0, type=float,
+                    metavar='Dropout', help='Dropout ratio')
+parser.add_argument('--schedule', type=int, nargs='+', default=[50, 75],
+                        help='Decrease learning rate at these epochs.')
+parser.add_argument('--gamma', type=float, default=0.1, help='LR is multiplied by gamma on schedule.')
+parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
+                    help='momentum')
+parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float,
+                    metavar='W', help='weight decay (default: 1e-4)')
+parser.add_argument('--resume', default='', type=str, metavar='PATH',
+                    help='path to latest checkpoint (default: none)')
+# Architecture
+parser.add_argument('--arch', '-a', metavar='ARCH', default='lenet',
+                    choices=model_names,
+                    help='model architecture: ' +
+                        ' | '.join(model_names) +
+                        ' (default: resnet18)')
+parser.add_argument('--depth', type=int, default=29, help='Model depth.')
+parser.add_argument('--cardinality', type=int, default=8, help='Model cardinality (group).')
+parser.add_argument('--widen-factor', type=int, default=4, help='Widen factor. 4 -> 64, 8 -> 128, ...')
+parser.add_argument('--growthRate', type=int, default=12, help='Growth rate for DenseNet.')
+parser.add_argument('--compressionRate', type=int, default=1, help='Compression Rate (theta) for DenseNet.')
+# Miscs
+parser.add_argument('--manualSeed', type=int, help='manual seed')
+parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
+                    help='evaluate model on validation set')
 
-torch.manual_seed(42)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+parser.add_argument('--save_dir', default='checkpoint/', type=str)
+#Device options
+parser.add_argument('--percent', default=0.9, type=float)
+parser.add_argument('--ours', dest='ours', default=False, action='store_true')
+parser.add_argument('--not-ours', dest='ours', action='store_false')
 
-LOG_INTERVAL = 20
-INIT_LR = 0.1
-WEIGHT_DECAY_RATE = 0.0005
-EPOCHS = 250
-REPEAT_WITH_DIFFERENT_SEED = 3
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+args = parser.parse_args()
+state = {k: v for k, v in args._get_kwargs()}
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# Validate dataset
+assert args.dataset == 'cifar10' or args.dataset == 'cifar100', 'Dataset can only be cifar10 or cifar100.'
 
+# Use CUDA
+use_cuda = torch.cuda.is_available()
+device = torch.device("cuda")
+# device = torch.device("cpu")
 
-def apply_prune_mask(net, keep_masks):
+# Random seed
+if args.manualSeed is None:
+    args.manualSeed = random.randint(1, 10000)
+random.seed(args.manualSeed)
+torch.manual_seed(args.manualSeed)
+if use_cuda:
+    torch.cuda.manual_seed_all(args.manualSeed)
 
-    # Before I can zip() layers and pruning masks I need to make sure they match
-    # one-to-one by removing all the irrelevant modules:
-    prunable_layers = filter(
-        lambda layer: isinstance(layer, nn.Conv2d) or isinstance(
-            layer, nn.Linear), net.modules())
+best_acc = 0  # best test accuracy
 
-    for layer, keep_mask in zip(prunable_layers, keep_masks):
-        assert (layer.weight.shape == keep_mask.shape)
+def main():
+    global best_acc
+    start_epoch = args.start_epoch  # start from epoch 0 or last checkpoint epoch
 
-        def hook_factory(keep_mask):
-            """
-            The hook function can't be defined directly here because of Python's
-            late binding which would result in all hooks getting the very last
-            mask! Getting it through another function forces early binding.
-            """
+    if not os.path.isdir(args.save_dir):
+        mkdir_p(args.save_dir)
 
-            def hook(grads):
-                return grads * keep_mask
-
-            return hook
-
-        # mask[i] == 0 --> Prune parameter
-        # mask[i] == 1 --> Keep parameter
-
-        # Step 1: Set the masked weights to zero (NB the biases are ignored)
-        # Step 2: Make sure their gradients remain zero
-        layer.weight.data[keep_mask == 0.] = 0.
-        layer.weight.register_hook(hook_factory(keep_mask))
-
-
-class LeNet_300_100(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        self.fc1 = nn.Linear(784, 300)
-        self.fc2 = nn.Linear(300, 100)
-        self.fc3 = nn.Linear(100, 10)
-
-    def forward(self, x):
-        x = F.relu(self.fc1(x.view(-1, 784)))
-        x = F.relu(self.fc2(x))
-        return F.log_softmax(self.fc3(x), dim=1)
-
-
-class LeNet_5(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        self.conv1 = nn.Conv2d(1, 6, 5, padding=2)
-        self.conv2 = nn.Conv2d(6, 16, 5)
-        self.fc3 = nn.Linear(16 * 5 * 5, 120)
-        self.fc4 = nn.Linear(120, 84)
-        self.fc5 = nn.Linear(84, 10)
-
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.max_pool2d(x, 2)
-        x = F.relu(self.conv2(x))
-        x = F.max_pool2d(x, 2)
-
-        x = F.relu(self.fc3(x.view(-1, 16 * 5 * 5)))
-        x = F.relu(self.fc4(x))
-        x = F.log_softmax(self.fc5(x))
-
-        return x
-
-
-class LeNet_5_Caffe(nn.Module):
-    """
-    This is based on Caffe's implementation of Lenet-5 and is slightly different
-    from the vanilla LeNet-5. Note that the first layer does NOT have padding
-    and therefore intermediate shapes do not match the official LeNet-5.
-    """
-
-    def __init__(self):
-        super().__init__()
-
-        self.conv1 = nn.Conv2d(1, 20, 5, padding=0)
-        self.conv2 = nn.Conv2d(20, 50, 5)
-        self.fc3 = nn.Linear(50 * 4 * 4, 500)
-        self.fc4 = nn.Linear(500, 10)
-
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.max_pool2d(x, 2)
-        x = F.relu(self.conv2(x))
-        x = F.max_pool2d(x, 2)
-
-        x = F.relu(self.fc3(x.view(-1, 50 * 4 * 4)))
-        x = F.log_softmax(self.fc4(x))
-
-        return x
-
-
-VGG_CONFIGS = {
-    # M for MaxPool, Number for channels
-    'D': [
-        64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'M', 512, 512, 512, 'M',
-        512, 512, 512, 'M'
-    ],
-}
-
-
-class VGG_SNIP(nn.Module):
-    """
-    This is a base class to generate three VGG variants used in SNIP paper:
-        1. VGG-C (16 layers)
-        2. VGG-D (16 layers)
-        3. VGG-like
-
-    Some of the differences:
-        * Reduced size of FC layers to 512
-        * Adjusted flattening to match CIFAR-10 shapes
-        * Replaced dropout layers with BatchNorm
-    """
-
-    def __init__(self, config, num_classes=10):
-        super().__init__()
-
-        self.features = self.make_layers(VGG_CONFIGS[config], batch_norm=True)
-
-        self.classifier = nn.Sequential(
-            nn.Linear(512, 512),  # 512 * 7 * 7 in the original VGG
-            nn.ReLU(True),
-            nn.BatchNorm1d(512),  # instead of dropout
-            nn.Linear(512, 512),
-            nn.ReLU(True),
-            nn.BatchNorm1d(512),  # instead of dropout
-            nn.Linear(512, num_classes),
-        )
-
-    @staticmethod
-    def make_layers(config, batch_norm=False):  # TODO: BN yes or no?
-        layers = []
-        in_channels = 3
-        for v in config:
-            if v == 'M':
-                layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
-            else:
-                conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=1)
-                if batch_norm:
-                    layers += [
-                        conv2d,
-                        nn.BatchNorm2d(v),
-                        nn.ReLU(inplace=True)
-                    ]
-                else:
-                    layers += [conv2d, nn.ReLU(inplace=True)]
-                in_channels = v
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        x = self.features(x)
-        x = x.view(x.size(0), -1)
-        x = self.classifier(x)
-        x = F.log_softmax(x, dim=1)
-        return x
-
-
-def get_mnist_dataloaders(train_batch_size, val_batch_size):
-
-    data_transform = Compose([transforms.ToTensor()])
-
-    # Normalise? transforms.Normalize((0.1307,), (0.3081,))
-
-    train_dataset = MNIST("_dataset", True, data_transform, download=True)
-    test_dataset = MNIST("_dataset", False, data_transform, download=False)
-
-    train_loader = DataLoader(
-        train_dataset,
-        train_batch_size,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True)
-    test_loader = DataLoader(
-        test_dataset,
-        val_batch_size,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True)
-
-    return train_loader, test_loader
-
-
-def get_cifar10_dataloaders(train_batch_size, test_batch_size):
-
-    train_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
+    # Data
+    print('==> Preparing dataset %s' % args.dataset)
+    # transform_train = transforms.Compose([
+    #     transforms.RandomCrop(32, padding=4),
+    #     transforms.RandomHorizontalFlip(),
+    #     transforms.ToTensor(),
+    #     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    # ])
+    #
+    # transform_test = transforms.Compose([
+    #     transforms.ToTensor(),
+    #     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    # ])
+    transform_train = transforms.Compose([
+        transforms.Pad(4, padding_mode='reflect'),
         transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(32),
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465),
-                             (0.2023, 0.1994, 0.2010)),
+        transforms.Normalize(np.array([125.3, 123.0, 113.9]) / 255.0,
+                             np.array([63.0, 62.1, 66.7]) / 255.0)
     ])
 
-    test_transform = transforms.Compose([
+    transform_test = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465),
-                             (0.2023, 0.1994, 0.2010)),
+        transforms.Normalize(np.array([125.3, 123.0, 113.9]) / 255.0,
+                             np.array([63.0, 62.1, 66.7]) / 255.0),
     ])
+    if args.dataset == 'cifar10':
+        dataloader = datasets.CIFAR10
+        num_classes = 10
+    else:
+        dataloader = datasets.CIFAR100
+        num_classes = 100
 
-    train_dataset = CIFAR10('_dataset', True, train_transform, download=True)
-    test_dataset = CIFAR10('_dataset', False, test_transform, download=False)
+    DATA_ROOT = '/media/ky/Data/data'
+    trainset = dataloader(root=DATA_ROOT, train=True, download=True, transform=transform_train)
+    trainloader = data.DataLoader(trainset, batch_size=args.train_batch, shuffle=True, num_workers=args.workers)
 
-    train_loader = DataLoader(
-        train_dataset,
-        train_batch_size,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True)
-    test_loader = DataLoader(
-        test_dataset,
-        test_batch_size,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True)
+    testset = dataloader(root=DATA_ROOT, train=False, download=True, transform=transform_test)
+    testloader = data.DataLoader(testset, batch_size=args.test_batch, shuffle=False, num_workers=args.workers)
 
-    return train_loader, test_loader
+    # Model
+    print("==> creating model '{}'".format(args.arch))
+    if args.arch.startswith('resnext'):
+        model = models.__dict__[args.arch](
+                    cardinality=args.cardinality,
+                    num_classes=num_classes,
+                    depth=args.depth,
+                    widen_factor=args.widen_factor,
+                    dropRate=args.drop,
+                )
+    elif args.arch.startswith('densenet'):
+        model = models.__dict__[args.arch](
+                    num_classes=num_classes,
+                    depth=args.depth,
+                    growthRate=args.growthRate,
+                    compressionRate=args.compressionRate,
+                    dropRate=args.drop,
+                )
+    elif args.arch.startswith('wrn'):
+        model = models.__dict__[args.arch](
+                    num_classes=num_classes,
+                    depth=args.depth,
+                    widen_factor=args.widen_factor,
+                    dropRate=args.drop,
+                )
+    elif args.arch.endswith('resnet'):
+        if args.ours:
+            model = resnet32_cifar100(3,4)
+        else:
+            model = models.__dict__[args.arch](
+                        num_classes=num_classes,
+                        depth=args.depth,)
+    else:
+        model = models.__dict__[args.arch](num_classes=num_classes)
 
+    # if not args.ours:
+    #     model = torch.nn.DataParallel(model).to(device)
+    model = model.to(device)
+    cudnn.benchmark = True
+    print('    Total params: %.2fM' % (sum(p.numel() for p in model.parameters())/1000000.0))
 
-def mnist_experiment():
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay) # default is 0.001
 
-    BATCH_SIZE = 100
-    LR_DECAY_INTERVAL = 25000
+    # Resume
+    title = 'cifar-10-' + args.arch
+    if args.resume:
+        # Load checkpoint.
+        print('==> Resuming from checkpoint..')
+        assert os.path.isfile(args.resume), 'Error: no checkpoint directory found!'
+        checkpoint = torch.load(args.resume)
+        if args.ours:
+            model.load_state_dict(checkpoint['state_dict'])
+        else:
+            model.load_state_dict(checkpoint['state_dict'])
 
-    # net = LeNet_300_100()
-    # net = LeNet_5()
-    net = LeNet_5_Caffe().to(device)
+    run_mode = 'reverse-ntk'
+    keep_ratio = 0.5
+    logger = Logger(os.path.join(args.save_dir, 'log-{}.txt'.format(run_mode)), title=title)
+    logger.set_names(['Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
 
-    optimiser = optim.SGD(
-        net.parameters(),
-        lr=INIT_LR,
-        momentum=0.9,
-        weight_decay=WEIGHT_DECAY_RATE)
-    lr_scheduler = optim.lr_scheduler.StepLR(optimiser, 30000, gamma=0.1)
+    # Prune
+    if run_mode == 'random':
+        Random_Prune(model, keep_ratio, trainloader, device)
+    else:
+        NTK_Prune(model, keep_ratio, trainloader, device)
 
-    train_loader, val_loader = get_mnist_dataloaders(BATCH_SIZE, BATCH_SIZE)
+    # Train and val
+    for epoch in range(start_epoch, args.epochs):
+        adjust_learning_rate(optimizer, epoch)
 
-    return net, optimiser, lr_scheduler, train_loader, val_loader
+        print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
+        num_parameters = get_conv_zero_param(model)
+        print('Zero parameters: {}'.format(num_parameters))
+        num_parameters = sum([param.nelement() for param in model.parameters()])
+        print('Parameters: {}'.format(num_parameters))
 
+        train_loss, train_acc = train(trainloader, model, criterion, optimizer, epoch, use_cuda)
+        test_loss, test_acc = test(testloader, model, criterion, epoch, use_cuda)
 
-def cifar10_experiment():
+        # append logger file
+        logger.append([state['lr'], train_loss, test_loss, train_acc, test_acc])
 
-    BATCH_SIZE = 128
-    LR_DECAY_INTERVAL = 30000
+        # save model
+        is_best = test_acc > best_acc
+        best_acc = max(test_acc, best_acc)
 
-    net = VGG_SNIP('D').to(device)
+        save_checkpoint({
+                'epoch': epoch + 1,
+                'state_dict': model.state_dict(),
+                'acc': test_acc,
+                'best_acc': best_acc,
+                'optimizer' : optimizer.state_dict(),
+            }, is_best, checkpoint=args.save_dir)
 
-    optimiser = optim.SGD(
-        net.parameters(),
-        lr=INIT_LR,
-        momentum=0.9,
-        weight_decay=WEIGHT_DECAY_RATE)
-    lr_scheduler = optim.lr_scheduler.StepLR(
-        optimiser, LR_DECAY_INTERVAL, gamma=0.1)
+    logger.close()
 
-    train_loader, val_loader = get_cifar10_dataloaders(BATCH_SIZE,
-                                                       BATCH_SIZE)  # TODO
+    print('Best acc:')
+    print(best_acc)
 
-    return net, optimiser, lr_scheduler, train_loader, val_loader
+def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
+    # switch to train mode
+    model.train()
 
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+    end = time.time()
 
-def train():
+    bar = Bar('Processing', max=len(trainloader))
+    for batch_idx, (inputs, targets) in enumerate(trainloader):
+        # measure data loading time
+        data_time.update(time.time() - end)
 
-    writer = SummaryWriter()
+        if use_cuda:
+            inputs, targets = inputs.to(device), targets.to(device)
+        inputs, targets = torch.autograd.Variable(inputs), torch.autograd.Variable(targets)
 
-    net, optimiser, lr_scheduler, train_loader, val_loader = cifar10_experiment()
+        # compute output
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
 
-    # Pre-training pruning using SKIP
-    keep_masks = SNIP(net, 0.05, train_loader, device)  # TODO: shuffle?
-    apply_prune_mask(net, keep_masks)
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
+        losses.update(loss.item(), inputs.size(0))
+        top1.update(prec1.item(), inputs.size(0))
+        top5.update(prec5.item(), inputs.size(0))
 
-    trainer = create_supervised_trainer(net, optimiser, F.nll_loss, device)
-    evaluator = create_supervised_evaluator(net, {
-        'accuracy': Accuracy(),
-        'nll': Loss(F.nll_loss)
-    }, device)
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+        loss.backward()
+        #-----------------------------------------
+        # Only train those with weight values greater than 0 - unpruned weights
+        for k, m in enumerate(model.modules()):
+            # print(k, m)
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+                weight_copy = m.weight.data.abs().clone()
+                mask = weight_copy.gt(0).float().to(device)
+                m.weight.grad.data.mul_(mask)
+        #-----------------------------------------
+        optimizer.step()
 
-    pbar = ProgressBar()
-    pbar.attach(trainer)
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
 
-    @trainer.on(Events.ITERATION_COMPLETED)
-    def log_training_loss(engine):
-        lr_scheduler.step()
-        iter_in_epoch = (engine.state.iteration - 1) % len(train_loader) + 1
-        if engine.state.iteration % LOG_INTERVAL == 0:
-            # pbar.log_message("Epoch[{}] Iteration[{}/{}] Loss: {:.2f}"
-            #       "".format(engine.state.epoch, iter_in_epoch, len(train_loader), engine.state.output))
-            writer.add_scalar("training/loss", engine.state.output,
-                              engine.state.iteration)
+        # plot progress
+        bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
+                    batch=batch_idx + 1,
+                    size=len(trainloader),
+                    data=data_time.avg,
+                    bt=batch_time.avg,
+                    total=bar.elapsed_td,
+                    eta=bar.eta_td,
+                    loss=losses.avg,
+                    top1=top1.avg,
+                    top5=top5.avg,
+                    )
+        bar.next()
+    bar.finish()
+    return (losses.avg, top1.avg)
 
-    @trainer.on(Events.EPOCH_COMPLETED)
-    def log_epoch(engine):
-        evaluator.run(val_loader)
+def test(testloader, model, criterion, epoch, use_cuda):
+    global best_acc
 
-        metrics = evaluator.state.metrics
-        avg_accuracy = metrics['accuracy']
-        avg_nll = metrics['nll']
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
 
-        # pbar.log_message("Validation Results - Epoch: {}  Avg accuracy: {:.2f} Avg loss: {:.2f}"
-        #       .format(engine.state.epoch, avg_accuracy, avg_nll))
+    # switch to evaluate mode
+    model.eval()
 
-        writer.add_scalar("validation/loss", avg_nll, engine.state.iteration)
-        writer.add_scalar("validation/accuracy", avg_accuracy,
-                          engine.state.iteration)
+    end = time.time()
+    bar = Bar('Processing', max=len(testloader))
+    for batch_idx, (inputs, targets) in enumerate(testloader):
+        # measure data loading time
+        data_time.update(time.time() - end)
 
-    trainer.run(train_loader, EPOCHS)
+        if use_cuda:
+            inputs, targets = inputs.to(device), targets.to(device)
+        inputs, targets = torch.autograd.Variable(inputs, volatile=True), torch.autograd.Variable(targets)
 
-    # Let's look at the final weights
-    # for name, param in net.named_parameters():
-    #     if name.endswith('weight'):
-    #         writer.add_histogram(name, param)
+        # compute output
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
 
-    writer.close()
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
+        losses.update(loss.item(), inputs.size(0))
+        top1.update(prec1.item(), inputs.size(0))
+        top5.update(prec5.item(), inputs.size(0))
 
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        # plot progress
+        bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
+                    batch=batch_idx + 1,
+                    size=len(testloader),
+                    data=data_time.avg,
+                    bt=batch_time.avg,
+                    total=bar.elapsed_td,
+                    eta=bar.eta_td,
+                    loss=losses.avg,
+                    top1=top1.avg,
+                    top5=top5.avg,
+                    )
+        bar.next()
+    bar.finish()
+    return (losses.avg, top1.avg)
+
+def save_checkpoint(state, is_best, checkpoint, filename='finetuned.pth.tar'):
+    filepath = os.path.join(checkpoint, filename)
+    torch.save(state, filepath)
+
+def adjust_learning_rate(optimizer, epoch):
+    global state
+    if epoch in args.schedule:
+        state['lr'] *= args.gamma
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = state['lr']
 
 if __name__ == '__main__':
-
-    for _ in range(REPEAT_WITH_DIFFERENT_SEED):
-        train()
+    main()
